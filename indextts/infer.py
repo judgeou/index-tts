@@ -274,7 +274,7 @@ class IndexTTS:
         if self.gr_progress is not None:
             self.gr_progress(value, desc=desc)
 
-    # 快速推理：对于“多句长文本”，可实现至少 2~10 倍以上的速度提升~ （First modified by sunnyboxs 2025-04-16）
+    # 快速推理：对于"多句长文本"，可实现至少 2~10 倍以上的速度提升~ （First modified by sunnyboxs 2025-04-16）
     def infer_fast(self, audio_prompt, text, output_path, verbose=False, max_text_tokens_per_sentence=100, sentences_bucket_max_size=4, **generation_kwargs):
         """
         Args:
@@ -496,16 +496,46 @@ class IndexTTS:
             wav_data = wav_data.numpy().T
             return (sampling_rate, wav_data)
 
-    # 原始推理模式
-    def infer(self, audio_prompt, text, output_path, verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
-        print(">> start inference...")
-        self._set_gr_progress(0, "start inference...")
+    # 流式推理模式 - 逐句生成音频片段
+    def infer_stream(self, audio_prompt, text, verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
+        """
+        流式推理函数，逐句生成音频片段
+        
+        Args:
+            audio_prompt: 参考音频路径
+            text: 要合成的文本
+            verbose: 是否输出详细信息
+            max_text_tokens_per_sentence: 每句最大token数
+            **generation_kwargs: 生成参数
+            
+        Yields:
+            dict: 包含音频片段信息的字典
+                - audio_chunk: torch.Tensor, 音频数据 (float32, 确保兼容性)
+                - sample_rate: int, 采样率
+                - sentence_index: int, 当前句子索引 (从0开始)
+                - total_sentences: int, 总句子数
+                - sentence_text: str, 当前句子的token文本
+                - timing_info: dict, 时间统计信息
+        """
+        print(">> start streaming inference...")
+        print(f"🚀 [DEBUG] infer_stream 开始处理，设备: {self.device}")
         if verbose:
             print(f"origin text:{text}")
         start_time = time.perf_counter()
+        
+        # 检查GPU内存使用情况
+        if "cuda" in str(self.device):
+            try:
+                import torch
+                gpu_memory_before = torch.cuda.memory_allocated() / 1024**3  # GB
+                print(f"🔍 [DEBUG] GPU内存使用 (开始): {gpu_memory_before:.2f} GB")
+            except:
+                pass
 
         # 如果参考音频改变了，才需要重新生成 cond_mel, 提升速度
+        cond_mel_start = time.perf_counter()
         if self.cache_cond_mel is None or self.cache_audio_prompt != audio_prompt:
+            print(f"🎵 [DEBUG] 开始处理参考音频: {audio_prompt}")
             audio, sr = torchaudio.load(audio_prompt)
             audio = torch.mean(audio, dim=0, keepdim=True)
             if audio.shape[0] > 1:
@@ -518,20 +548,30 @@ class IndexTTS:
 
             self.cache_audio_prompt = audio_prompt
             self.cache_cond_mel = cond_mel
+            print(f"✅ [DEBUG] 参考音频处理完成，耗时: {time.perf_counter() - cond_mel_start:.3f}s")
         else:
             cond_mel = self.cache_cond_mel
             cond_mel_frame = cond_mel.shape[-1]
-            pass
+            print(f"🔄 [DEBUG] 使用缓存的参考音频，耗时: {time.perf_counter() - cond_mel_start:.3f}s")
 
-        self._set_gr_progress(0.1, "text processing...")
+        # 文本处理
+        text_process_start = time.perf_counter()
         auto_conditioning = cond_mel
         text_tokens_list = self.tokenizer.tokenize(text)
         sentences = self.tokenizer.split_sentences(text_tokens_list, max_text_tokens_per_sentence)
+        text_process_time = time.perf_counter() - text_process_start
+        
+        print(f"📝 [DEBUG] 文本处理完成，耗时: {text_process_time:.3f}s")
+        print(f"📊 [DEBUG] 文本统计: 总token={len(text_tokens_list)}, 句子数={len(sentences)}, 每句最大token={max_text_tokens_per_sentence}")
+        
         if verbose:
             print("text token count:", len(text_tokens_list))
             print("sentences count:", len(sentences))
             print("max_text_tokens_per_sentence:", max_text_tokens_per_sentence)
             print(*sentences, sep="\n")
+        
+        # 提取生成参数
+        params_start = time.perf_counter()
         do_sample = generation_kwargs.pop("do_sample", True)
         top_p = generation_kwargs.pop("top_p", 0.8)
         top_k = generation_kwargs.pop("top_k", 30)
@@ -542,38 +582,54 @@ class IndexTTS:
         repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 600)
         sampling_rate = 24000
-        # lang = "EN"
-        # lang = "ZH"
-        wavs = []
-        gpt_gen_time = 0
-        gpt_forward_time = 0
-        bigvgan_time = 0
-        progress = 0
+        params_time = time.perf_counter() - params_start
+        print(f"⚙️ [DEBUG] 参数处理完成，耗时: {params_time:.3f}s")
+        
+        total_sentences = len(sentences)
         has_warned = False
-        for sent in sentences:
+        cumulative_gpt_gen_time = 0
+        cumulative_gpt_forward_time = 0
+        cumulative_bigvgan_time = 0
+        
+        print(f"🔄 [DEBUG] 开始逐句处理 {total_sentences} 个句子")
+        
+        for sentence_idx, sent in enumerate(sentences):
+            sentence_start_time = time.perf_counter()
+            print(f"\n🔄 [DEBUG] === 处理第 {sentence_idx + 1}/{total_sentences} 句 ===")
+            
+            # 检查GPU内存
+            if "cuda" in str(self.device):
+                try:
+                    gpu_memory_current = torch.cuda.memory_allocated() / 1024**3  # GB
+                    print(f"🔍 [DEBUG] 当前GPU内存: {gpu_memory_current:.2f} GB")
+                except:
+                    pass
+            
+            # 🔥 关键修复：清理GPT模型的KV缓存，防止跨句子累积
+            if hasattr(self.gpt, 'inference_model') and hasattr(self.gpt.inference_model, 'cached_mel_emb'):
+                # 重新设置mel embedding缓存，清理之前的状态
+                self.gpt.inference_model.store_mel_emb(auto_conditioning)
+                print(f"🧠 [DEBUG] 清理GPT KV缓存并重设mel embedding")
+            
+            # 文本token处理
+            token_start = time.perf_counter()
             text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
             text_tokens = torch.tensor(text_tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
-            # text_tokens = F.pad(text_tokens, (0, 1))  # This may not be necessary.
-            # text_tokens = F.pad(text_tokens, (1, 0), value=0)
-            # text_tokens = F.pad(text_tokens, (0, 1), value=1)
+            token_time = time.perf_counter() - token_start
+            print(f"📝 [DEBUG] Token处理耗时: {token_time:.3f}s, shape: {text_tokens.shape}")
+            
             if verbose:
-                print(text_tokens)
+                print(f"\n--- Processing sentence {sentence_idx + 1}/{total_sentences} ---")
                 print(f"text_tokens shape: {text_tokens.shape}, text_tokens type: {text_tokens.dtype}")
-                # debug tokenizer
-                text_token_syms = self.tokenizer.convert_ids_to_tokens(text_tokens[0].tolist())
-                print("text_token_syms is same as sentence tokens", text_token_syms == sent)
 
-            # text_len = torch.IntTensor([text_tokens.size(1)], device=text_tokens.device)
-            # print(text_len)
-            progress += 1
-            self._set_gr_progress(0.2 + 0.4 * (progress-1) / len(sentences), f"gpt inference latent... {progress}/{len(sentences)}")
-            m_start_time = time.perf_counter()
+            # GPT inference_speech 生成codes
+            print(f"🧠 [DEBUG] 开始GPT inference_speech...")
+            gpt_gen_start = time.perf_counter()
             with torch.no_grad():
                 with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
                     codes = self.gpt.inference_speech(auto_conditioning, text_tokens,
                                                         cond_mel_lengths=torch.tensor([auto_conditioning.shape[-1]],
                                                                                       device=text_tokens.device),
-                                                        # text_lengths=text_len,
                                                         do_sample=do_sample,
                                                         top_p=top_p,
                                                         top_k=top_k,
@@ -584,79 +640,429 @@ class IndexTTS:
                                                         repetition_penalty=repetition_penalty,
                                                         max_generate_length=max_mel_tokens,
                                                         **generation_kwargs)
-                gpt_gen_time += time.perf_counter() - m_start_time
-                if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
-                    warnings.warn(
-                        f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}). "
-                        f"Input text tokens: {text_tokens.shape[1]}. "
-                        f"Consider reducing `max_text_tokens_per_sentence`({max_text_tokens_per_sentence}) or increasing `max_mel_tokens`.",
-                        category=RuntimeWarning
-                    )
-                    has_warned = True
+            gpt_gen_time = time.perf_counter() - gpt_gen_start
+            cumulative_gpt_gen_time += gpt_gen_time
+            print(f"✅ [DEBUG] GPT inference_speech完成，耗时: {gpt_gen_time:.3f}s")
+            
+            # 🔍 检查GPT生成后的内存
+            if "cuda" in str(self.device):
+                try:
+                    gpu_memory_after_gpt_gen = torch.cuda.memory_allocated() / 1024**3  # GB
+                    print(f"🔍 [DEBUG] GPT生成后GPU内存: {gpu_memory_after_gpt_gen:.2f} GB")
+                except:
+                    pass
+            
+            if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
+                warnings.warn(
+                    f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}). "
+                    f"Input text tokens: {text_tokens.shape[1]}. "
+                    f"Consider reducing `max_text_tokens_per_sentence`({max_text_tokens_per_sentence}) or increasing `max_mel_tokens`.",
+                    category=RuntimeWarning
+                )
+                has_warned = True
 
-                code_lens = torch.tensor([codes.shape[-1]], device=codes.device, dtype=codes.dtype)
-                if verbose:
-                    print(codes, type(codes))
-                    print(f"codes shape: {codes.shape}, codes type: {codes.dtype}")
-                    print(f"code len: {code_lens}")
+            # 🎯 修复codes处理逻辑 - 更安全的类型检查和处理
+            codes_process_start = time.perf_counter()
+            
+            # 统一处理codes - 确保始终是Tensor格式
+            # 使用更安全的类型检查方式，避免linter错误
+            if hasattr(codes, 'sequences') and not isinstance(codes, torch.Tensor):
+                # GenerateOutput对象，提取sequences
+                codes = getattr(codes, 'sequences')
+                print(f"🔧 [DEBUG] 从GenerateOutput提取sequences")
+            elif isinstance(codes, torch.Tensor):
+                # 已经是Tensor
+                print(f"🔧 [DEBUG] codes已经是Tensor格式")
+            else:
+                # 其他情况，尝试转换
+                codes = torch.tensor(codes, device=self.device)
+                print(f"🔧 [DEBUG] 转换codes为Tensor")
+            
+            # 确保codes是Tensor并且维度正确
+            if isinstance(codes, torch.Tensor) and codes.dim() == 1:
+                codes = codes.unsqueeze(0)
+            
+            code_lens = torch.tensor([codes.shape[-1]], device=codes.device, dtype=torch.long)
+            codes_process_time = time.perf_counter() - codes_process_start
+            print(f"🔧 [DEBUG] Codes处理耗时: {codes_process_time:.3f}s, shape: {codes.shape}")
+            
+            if verbose:
+                print(f"codes shape: {codes.shape}, codes type: {codes.dtype}")
+                print(f"code len: {code_lens}")
 
-                # remove ultra-long silence if exits
-                # temporarily fix the long silence bug.
-                codes, code_lens = self.remove_long_silence(codes, silent_token=52, max_consecutive=30)
-                if verbose:
-                    print(codes, type(codes))
-                    print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
-                    print(f"code len: {code_lens}")
-                self._set_gr_progress(0.2 + 0.4 * progress / len(sentences), f"gpt inference speech... {progress}/{len(sentences)}")
-                m_start_time = time.perf_counter()
-                # latent, text_lens_out, code_lens_out = \
+            # 移除超长静音
+            silence_start = time.perf_counter()
+            codes, code_lens = self.remove_long_silence(codes, silent_token=52, max_consecutive=30)
+            silence_time = time.perf_counter() - silence_start
+            print(f"🔇 [DEBUG] 静音移除耗时: {silence_time:.3f}s")
+            if verbose:
+                print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
+                print(f"code len: {code_lens}")
+                
+            # GPT forward 生成latent
+            print(f"🧠 [DEBUG] 开始GPT forward...")
+            gpt_forward_start = time.perf_counter()
+            with torch.no_grad():  # 确保没有梯度计算
                 with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
-                    latent = \
-                        self.gpt(auto_conditioning, text_tokens,
+                    latent = self.gpt(auto_conditioning, text_tokens,
                                     torch.tensor([text_tokens.shape[-1]], device=text_tokens.device), codes,
                                     code_lens*self.gpt.mel_length_compression,
                                     cond_mel_lengths=torch.tensor([auto_conditioning.shape[-1]], device=text_tokens.device),
                                     return_latent=True, clip_inputs=False)
-                    gpt_forward_time += time.perf_counter() - m_start_time
+            gpt_forward_time = time.perf_counter() - gpt_forward_start
+            cumulative_gpt_forward_time += gpt_forward_time
+            print(f"✅ [DEBUG] GPT forward完成，耗时: {gpt_forward_time:.3f}s")
+            
+            # 🔍 检查GPT forward后的内存
+            if "cuda" in str(self.device):
+                try:
+                    gpu_memory_after_gpt_forward = torch.cuda.memory_allocated() / 1024**3  # GB
+                    print(f"🔍 [DEBUG] GPT forward后GPU内存: {gpu_memory_after_gpt_forward:.2f} GB")
+                except:
+                    pass
 
-                    m_start_time = time.perf_counter()
-                    wav, _ = self.bigvgan(latent, auto_conditioning.transpose(1, 2))
-                    bigvgan_time += time.perf_counter() - m_start_time
-                    wav = wav.squeeze(1)
+            # BigVGAN 生成wav
+            print(f"🎵 [DEBUG] 开始BigVGAN生成...")
+            bigvgan_start = time.perf_counter()
+            with torch.no_grad():  # 确保没有梯度计算
+                wav, _ = self.bigvgan(latent, auto_conditioning.transpose(1, 2))
+            bigvgan_time = time.perf_counter() - bigvgan_start
+            cumulative_bigvgan_time += bigvgan_time
+            print(f"✅ [DEBUG] BigVGAN完成，耗时: {bigvgan_time:.3f}s")
+            
+            # 🔍 检查BigVGAN后的内存
+            if "cuda" in str(self.device):
+                try:
+                    gpu_memory_after_bigvgan = torch.cuda.memory_allocated() / 1024**3  # GB
+                    print(f"🔍 [DEBUG] BigVGAN后GPU内存: {gpu_memory_after_bigvgan:.2f} GB")
+                except:
+                    pass
+            
+            # 🎯 修复音频后处理 - 确保Android兼容性
+            postprocess_start = time.perf_counter()
+            
+            # 确保单声道输出 (Android兼容性)
+            if wav.dim() > 2:
+                wav = wav.squeeze()
+            if wav.dim() == 2:
+                if wav.shape[0] == 1:
+                    wav = wav.squeeze(0)  # 移除批次维度
+                elif wav.shape[1] == 1:
+                    wav = wav.squeeze(1)  # 移除声道维度
+                else:
+                    wav = wav[0]  # 取第一个声道
+            
+            # 确保wav是一维的
+            if wav.dim() != 1:
+                wav = wav.flatten()
+            
+            # 音频归一化和类型转换
+            wav = torch.clamp(wav, -1.0, 1.0)  # 首先归一化到[-1,1]
+            
+            # 转换为CPU并保持float32格式（更好的兼容性）
+            wav_cpu = wav.cpu().float()
+            
+            if verbose:
+                print(f"wav shape: {wav_cpu.shape}", "min:", wav_cpu.min(), "max:", wav_cpu.max())
+            
+            postprocess_time = time.perf_counter() - postprocess_start
+            print(f"🔄 [DEBUG] 音频后处理耗时: {postprocess_time:.3f}s, 输出shape: {wav_cpu.shape}")
+            
+            sentence_total_time = time.perf_counter() - sentence_start_time
+            
+            # 准备时间统计信息
+            timing_info = {
+                'sentence_total_time': sentence_total_time,
+                'gpt_gen_time': gpt_gen_time,
+                'gpt_forward_time': gpt_forward_time,
+                'bigvgan_time': bigvgan_time,
+                'token_time': token_time,
+                'codes_process_time': codes_process_time,
+                'silence_time': silence_time,
+                'postprocess_time': postprocess_time,
+                'cumulative_total_time': time.perf_counter() - start_time,
+                'cumulative_gpt_gen_time': cumulative_gpt_gen_time,
+                'cumulative_gpt_forward_time': cumulative_gpt_forward_time,
+                'cumulative_bigvgan_time': cumulative_bigvgan_time,
+            }
+            
+            print(f"⏱️ [DEBUG] 句子 {sentence_idx + 1} 总耗时: {sentence_total_time:.3f}s")
+            print(f"📊 [DEBUG] 详细耗时分布:")
+            print(f"    - GPT生成: {gpt_gen_time:.3f}s ({gpt_gen_time/sentence_total_time*100:.1f}%)")
+            print(f"    - GPT前向: {gpt_forward_time:.3f}s ({gpt_forward_time/sentence_total_time*100:.1f}%)")
+            print(f"    - BigVGAN: {bigvgan_time:.3f}s ({bigvgan_time/sentence_total_time*100:.1f}%)")
+            print(f"    - 其他处理: {(sentence_total_time-gpt_gen_time-gpt_forward_time-bigvgan_time):.3f}s")
+            
+            # yield 当前句子的音频片段 - 返回float32格式的tensor
+            yield {
+                'audio_chunk': wav_cpu,  # 现在返回torch.Tensor (float32)
+                'sample_rate': sampling_rate,
+                'sentence_index': sentence_idx,
+                'total_sentences': total_sentences,
+                'sentence_text': ' '.join(sent),  # 重建句子文本用于显示
+                'timing_info': timing_info
+            }
+            
+            # 🔥 强制清理GPU缓存和变量，防止内存泄漏
+            cache_start = time.perf_counter()
+            
+            # 🎯 关键：创建临时引用列表，确保所有中间张量都被删除
+            temp_tensors = [codes, latent, wav, wav_cpu, text_tokens]
+            if 'code_lens' in locals():
+                temp_tensors.append(code_lens)
+            
+            # 批量删除所有临时张量
+            for tensor in temp_tensors:
+                if isinstance(tensor, torch.Tensor):
+                    del tensor
+            del temp_tensors
+            
+            # 🧠 清理GPT模型的内部状态和缓存
+            if hasattr(self.gpt, 'inference_model') and hasattr(self.gpt.inference_model, 'transformer'):
+                # 清理transformer的past_key_values缓存
+                for layer in self.gpt.inference_model.transformer.h:
+                    if hasattr(layer, 'attn') and hasattr(layer.attn, 'past_key_value'):
+                        try:
+                            setattr(layer.attn, 'past_key_value', None)
+                        except (AttributeError, TypeError):
+                            # 如果设置失败，跳过该层
+                            pass
+            
+            # 强制清理GPU缓存
+            self.torch_empty_cache()
+            
+            # 额外的强制清理
+            if "cuda" in str(self.device):
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()  # 同步CUDA操作
+                    # 清理CUDA内存分配器的内存碎片
+                    torch.cuda.reset_peak_memory_stats()
+                except:
+                    pass
+            
+            cache_time = time.perf_counter() - cache_start
+            print(f"🧹 [DEBUG] 强化GPU缓存清理耗时: {cache_time:.3f}s")
+            
+            # 检查清理后的GPU内存
+            if "cuda" in str(self.device):
+                try:
+                    gpu_memory_after = torch.cuda.memory_allocated() / 1024**3  # GB
+                    print(f"🔍 [DEBUG] 清理后GPU内存: {gpu_memory_after:.2f} GB")
+                except:
+                    pass
 
-                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
-                if verbose:
-                    print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-                # wavs.append(wav[:, :-512])
-                wavs.append(wav.cpu())  # to cpu before saving
-        end_time = time.perf_counter()
-        self._set_gr_progress(0.9, "save audio...")
-        wav = torch.cat(wavs, dim=1)
-        wav_length = wav.shape[-1] / sampling_rate
+        total_time = time.perf_counter() - start_time
+        print(f"\n📊 [DEBUG] === 流式推理完成总结 ===")
         print(f">> Reference audio length: {cond_mel_frame * 256 / sampling_rate:.2f} seconds")
-        print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
-        print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
-        print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
-        print(f">> Total inference time: {end_time - start_time:.2f} seconds")
-        print(f">> Generated audio length: {wav_length:.2f} seconds")
-        print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+        print(f">> Total streaming inference time: {total_time:.2f} seconds")
+        print(f">> Total gpt_gen_time: {cumulative_gpt_gen_time:.2f} seconds ({cumulative_gpt_gen_time/total_time*100:.1f}%)")
+        print(f">> Total gpt_forward_time: {cumulative_gpt_forward_time:.2f} seconds ({cumulative_gpt_forward_time/total_time*100:.1f}%)")
+        print(f">> Total bigvgan_time: {cumulative_bigvgan_time:.2f} seconds ({cumulative_bigvgan_time/total_time*100:.1f}%)")
+        print(f">> 平均每句耗时: {total_time/total_sentences:.2f} seconds")
+        
+        # 最终GPU内存检查
+        if "cuda" in str(self.device):
+            try:
+                gpu_memory_final = torch.cuda.memory_allocated() / 1024**3  # GB
+                print(f"🔍 [DEBUG] 最终GPU内存: {gpu_memory_final:.2f} GB")
+            except:
+                pass
 
-        # save audio
-        wav = wav.cpu()  # to cpu
+    def infer_stream_pcm(self, audio_prompt, text, verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
+        """
+        流式推理函数，逐句生成音频片段并返回16bit PCM字节数据
+        
+        Args:
+            audio_prompt: 参考音频路径
+            text: 要合成的文本
+            verbose: 是否输出详细信息
+            max_text_tokens_per_sentence: 每句最大token数
+            **generation_kwargs: 生成参数
+            
+        Yields:
+            dict: 包含音频片段信息的字典
+                - audio_pcm_bytes: bytes, 16bit PCM音频数据
+                - sample_rate: int, 采样率
+                - sentence_index: int, 当前句子索引 (从0开始)
+                - total_sentences: int, 总句子数
+                - sentence_text: str, 当前句子的token文本
+                - timing_info: dict, 时间统计信息
+        """
+        for chunk_info in self.infer_stream(audio_prompt, text, verbose, max_text_tokens_per_sentence, **generation_kwargs):
+            # 获取音频数据 (torch.Tensor, float32, 单声道)
+            audio_chunk = chunk_info['audio_chunk']
+            
+            # 🎯 完全模仿infer函数的tensor处理逻辑
+            # 确保是一维张量
+            if audio_chunk.dim() != 1:
+                audio_chunk = audio_chunk.flatten()
+            
+            # 确保单声道输出，添加声道维度以符合处理要求
+            if audio_chunk.dim() == 1:
+                wav = audio_chunk.unsqueeze(0)  # (length,) -> (1, length)
+            else:
+                wav = audio_chunk
+            
+            # 计算音频长度用于检查
+            sampling_rate = 24000
+            wav_length = wav.shape[-1] / sampling_rate
+            
+            # 🎯 音频质量验证和Android兼容性处理 (完全模仿infer函数)
+            if wav_length > 0:
+                # 音频质量检查
+                wav_max = wav.abs().max()
+                if wav_max > 1.0:
+                    if verbose:
+                        print(f"⚠️ [DEBUG] 音频超出范围 (max={wav_max:.4f})，进行归一化")
+                    wav = wav / wav_max
+                
+                # 确保没有NaN或Inf
+                if torch.isnan(wav).any() or torch.isinf(wav).any():
+                    if verbose:
+                        print(f"❌ [DEBUG] 检测到NaN或Inf，使用零替换")
+                    wav = torch.nan_to_num(wav, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                if verbose:
+                    print(f"✅ [DEBUG] 音频质量验证完成: shape={wav.shape}, range=[{wav.min():.4f}, {wav.max():.4f}]")
+
+            # 转换为int16格式 (完全模仿infer函数)
+            wav_int16 = (wav * 32767).clamp(-32767, 32767).type(torch.int16)
+            
+            # 转换为字节数据
+            pcm_bytes = wav_int16.numpy().tobytes()
+            
+            # 修改返回的字典，替换 audio_chunk 为 PCM 字节数据
+            yield {
+                'audio_pcm_bytes': pcm_bytes,
+                'sample_rate': chunk_info['sample_rate'],
+                'sentence_index': chunk_info['sentence_index'],
+                'total_sentences': chunk_info['total_sentences'],
+                'sentence_text': chunk_info['sentence_text'],
+                'timing_info': chunk_info['timing_info']
+            }
+
+    # 原始推理模式 - 现在调用 infer_stream 并拼接结果
+    def infer(self, audio_prompt, text, output_path, verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
+        """
+        传统的推理函数，现在内部调用 infer_stream 并拼接所有音频片段
+        
+        Args:
+            audio_prompt: 参考音频路径
+            text: 要合成的文本
+            output_path: 输出文件路径，如果为None则返回Gradio格式
+            verbose: 是否输出详细信息
+            max_text_tokens_per_sentence: 每句最大token数
+            **generation_kwargs: 生成参数
+            
+        Returns:
+            str: 输出文件路径（如果指定了output_path）
+            tuple: (sample_rate, wav_data) Gradio格式（如果output_path为None）
+        """
+        start_time = time.perf_counter()
+        
+        # 收集所有音频片段
+        wav_chunks = []
+        total_sentences = 0
+        final_timing_info = None
+        
+        # 使用流式推理收集所有音频片段
+        for chunk_info in self.infer_stream(audio_prompt, text, verbose, max_text_tokens_per_sentence, **generation_kwargs):
+            # 现在audio_chunk已经是float32的torch.Tensor，直接添加
+            wav_chunks.append(chunk_info['audio_chunk'])
+            total_sentences = chunk_info['total_sentences']
+            final_timing_info = chunk_info['timing_info']
+            
+            # 更新进度条
+            progress = (chunk_info['sentence_index'] + 1) / total_sentences
+            self._set_gr_progress(0.1 + 0.8 * progress, f"Processing sentence {chunk_info['sentence_index'] + 1}/{total_sentences}")
+            
+            if verbose:
+                print(f">> Collected chunk {chunk_info['sentence_index'] + 1}/{total_sentences}, "
+                      f"shape: {chunk_info['audio_chunk'].shape}")
+
+        self._set_gr_progress(0.9, "Concatenating audio...")
+        
+        # 🎯 修复音频拼接逻辑 - 确保Android兼容性
+        if len(wav_chunks) > 0:
+            print(f"🔧 [DEBUG] 拼接 {len(wav_chunks)} 个音频片段")
+            
+            # 确保所有片段都是一维的
+            normalized_chunks = []
+            for i, chunk in enumerate(wav_chunks):
+                if chunk.dim() != 1:
+                    chunk = chunk.flatten()
+                normalized_chunks.append(chunk)
+                if verbose:
+                    print(f"  - 片段 {i+1}: shape={chunk.shape}, min={chunk.min():.4f}, max={chunk.max():.4f}")
+            
+            # 拼接所有音频片段
+            wav = torch.cat(normalized_chunks, dim=0)  # 沿时间轴拼接
+            
+            # 确保单声道输出，添加声道维度以符合torchaudio.save要求
+            if wav.dim() == 1:
+                wav = wav.unsqueeze(0)  # (length,) -> (1, length)
+            
+            print(f"🎯 [DEBUG] 拼接完成: shape={wav.shape}, dtype={wav.dtype}")
+        else:
+            # 处理空结果的情况
+            sampling_rate = 24000
+            wav = torch.zeros((1, 0), dtype=torch.float32)
+            print(f"⚠️ [DEBUG] 没有音频片段，创建空音频")
+            
+        end_time = time.perf_counter()
+        sampling_rate = 24000
+        wav_length = wav.shape[-1] / sampling_rate
+        
+        # 打印最终统计信息
+        if final_timing_info:
+            print(f">> Total inference time: {end_time - start_time:.2f} seconds")
+            print(f">> Generated audio length: {wav_length:.2f} seconds")
+            print(f">> RTF: {(end_time - start_time) / wav_length:.4f}" if wav_length > 0 else ">> RTF: N/A (no audio generated)")
+
+        # 🎯 音频质量验证和Android兼容性处理
+        if wav_length > 0:
+            # 音频质量检查
+            wav_max = wav.abs().max()
+            if wav_max > 1.0:
+                print(f"⚠️ [DEBUG] 音频超出范围 (max={wav_max:.4f})，进行归一化")
+                wav = wav / wav_max
+            
+            # 确保没有NaN或Inf
+            if torch.isnan(wav).any() or torch.isinf(wav).any():
+                print(f"❌ [DEBUG] 检测到NaN或Inf，使用零替换")
+                wav = torch.nan_to_num(wav, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            print(f"✅ [DEBUG] 音频质量验证完成: shape={wav.shape}, range=[{wav.min():.4f}, {wav.max():.4f}]")
+
+        # 保存或返回音频
         if output_path:
-            # 直接保存音频到指定路径中
+            # 保存WAV文件 - 使用Android兼容的格式
             if os.path.isfile(output_path):
                 os.remove(output_path)
                 print(">> remove old wav file:", output_path)
             if os.path.dirname(output_path) != "":
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
-            print(">> wav file saved to:", output_path)
+            
+            # 转换为int16格式并保存 (Android通用格式)
+            wav_int16 = (wav * 32767).clamp(-32767, 32767).type(torch.int16)
+            
+            # 保存时明确指定编码格式，确保Android兼容性
+            torchaudio.save(
+                output_path, 
+                wav_int16, 
+                sampling_rate,
+                encoding="PCM_S",  # 16-bit PCM
+                bits_per_sample=16
+            )
+            print(f">> wav file saved to: {output_path} (format: 16-bit PCM, {sampling_rate}Hz, mono)")
             return output_path
         else:
-            # 返回以符合Gradio的格式要求
-            wav_data = wav.type(torch.int16)
-            wav_data = wav_data.numpy().T
+            # 返回以符合Gradio的格式要求 (int16 array)
+            wav_int16 = (wav * 32767).clamp(-32767, 32767).type(torch.int16)
+            wav_data = wav_int16.numpy()
+            if wav_data.ndim == 2:
+                wav_data = wav_data.T  # Gradio期望 (time, channels) 格式
             return (sampling_rate, wav_data)
 
 
