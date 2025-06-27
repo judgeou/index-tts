@@ -3,6 +3,7 @@ import tempfile
 import time
 from typing import Optional
 from pathlib import Path
+import asyncio
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -31,6 +32,17 @@ app.add_middleware(
 
 # 全局变量存储模型实例
 tts_model: Optional[IndexTTS] = None
+
+# 用于流式 Opus 合成的排队锁，确保一次只处理一个请求
+opus_synthesis_lock = asyncio.Lock()
+
+# 用于跟踪当前正在处理的请求信息
+current_opus_request = {
+    "is_processing": False,
+    "start_time": None,
+    "text_preview": None,
+    "reference_audio_index": None
+}
 
 # 预设的参考音频文件列表
 REFERENCE_AUDIO_FILES = [
@@ -69,6 +81,25 @@ class StreamSynthesizeRequest(BaseModel):
     reference_audio_index: int = Field(default=0, description="参考音频序号 (从0开始)")
     verbose: bool = Field(default=False, description="是否输出详细日志")
     max_text_tokens_per_sentence: int = Field(default=120, description="每句话的最大token数")
+    # 生成参数
+    do_sample: bool = Field(default=True, description="是否使用采样")
+    top_p: float = Field(default=0.95, description="top_p 采样参数")
+    top_k: int = Field(default=30, description="top_k 采样参数")
+    temperature: float = Field(default=1.2, description="温度参数")
+    length_penalty: float = Field(default=0.0, description="长度惩罚")
+    num_beams: int = Field(default=3, description="束搜索数量")
+    repetition_penalty: float = Field(default=10.0, description="重复惩罚")
+    max_mel_tokens: int = Field(default=600, description="最大mel token数量")
+
+
+class StreamOpusSynthesizeRequest(BaseModel):
+    text: str = Field(..., description="要合成的文本")
+    reference_audio_index: int = Field(default=0, description="参考音频序号 (从0开始)")
+    verbose: bool = Field(default=False, description="是否输出详细日志")
+    max_text_tokens_per_sentence: int = Field(default=120, description="每句话的最大token数")
+    # Opus 编码参数
+    opus_bitrate: int = Field(default=32000, description="Opus编码比特率 (8000-512000)")
+    opus_complexity: int = Field(default=10, description="Opus编码复杂度 (0-10)")
     # 生成参数
     do_sample: bool = Field(default=True, description="是否使用采样")
     top_p: float = Field(default=0.95, description="top_p 采样参数")
@@ -382,6 +413,138 @@ async def synthesize_stream(request: StreamSynthesizeRequest):
     )
 
 
+@app.post("/synthesize_stream_opus")
+async def synthesize_stream_opus(request: StreamOpusSynthesizeRequest):
+    """
+    流式 Opus 语音合成接口（带排队功能）
+    
+    返回 Opus 编码的音频数据流，相比 PCM 大幅减少流量消耗
+    适合网络传输和实时音频应用
+    
+    注意：该接口使用排队机制，一次只处理一个请求，确保模型资源不被争用
+    
+    Args:
+        request: 包含合成参数和 Opus 编码参数的请求体
+    
+    Returns:
+        StreamingResponse: Opus 编码的音频数据流
+    """
+    if tts_model is None:
+        raise HTTPException(status_code=500, detail="模型未加载")
+    
+    if not request.text.strip():
+        raise HTTPException(status_code=400, detail="文本不能为空")
+    
+    # 验证参考音频序号
+    if request.reference_audio_index < 0 or request.reference_audio_index >= len(REFERENCE_AUDIO_FILES):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"参考音频序号无效: {request.reference_audio_index}. 有效范围: 0-{len(REFERENCE_AUDIO_FILES)-1}"
+        )
+    
+    # 获取参考音频文件路径
+    audio_prompt_path = REFERENCE_AUDIO_FILES[request.reference_audio_index]
+    
+    # 检查参考音频文件是否存在
+    if not os.path.exists(audio_prompt_path):
+        raise HTTPException(
+            status_code=500, 
+            detail=f"参考音频文件不存在: {audio_prompt_path}"
+        )
+    
+    # 检查是否有其他请求正在处理
+    if opus_synthesis_lock.locked():
+        print(f"⏳ 有其他请求正在处理中，当前请求正在排队等待...")
+    
+    # 获取排队锁，确保一次只处理一个请求
+    async with opus_synthesis_lock:
+        # 更新当前处理状态
+        current_opus_request["is_processing"] = True
+        current_opus_request["start_time"] = time.time()
+        current_opus_request["text_preview"] = request.text[:50] + ("..." if len(request.text) > 50 else "")
+        current_opus_request["reference_audio_index"] = request.reference_audio_index
+        
+        print(f"🎤 开始流式 Opus 语音合成 (已获取处理锁):")
+        print(f"   文本: {request.text}")
+        print(f"   参考音频: {audio_prompt_path}")
+        print(f"   Opus 比特率: {request.opus_bitrate}bps")
+        print(f"   Opus 复杂度: {request.opus_complexity}")
+        
+        # 准备生成参数
+        generation_kwargs = {
+            "do_sample": request.do_sample,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "temperature": request.temperature,
+            "length_penalty": request.length_penalty,
+            "num_beams": request.num_beams,
+            "repetition_penalty": request.repetition_penalty,
+            "max_mel_tokens": request.max_mel_tokens,
+        }
+        
+        async def generate_opus_stream():
+            """生成 Opus 数据流的异步生成器函数"""
+            try:
+                # 直接调用 infer_opus，它现在返回 bytes 流
+                assert tts_model is not None, "模型实例不应为None"
+                chunk_count = 0
+                for opus_bytes in tts_model.infer_opus(
+                    audio_prompt=audio_prompt_path,
+                    text=request.text,
+                    verbose=request.verbose,
+                    max_text_tokens_per_sentence=request.max_text_tokens_per_sentence,
+                    opus_bitrate=request.opus_bitrate,
+                    opus_complexity=request.opus_complexity,
+                    **generation_kwargs
+                ):
+                    chunk_count += 1
+                    
+                    # 直接 yield Opus 字节数据
+                    yield opus_bytes
+                    
+                    # 强制刷新：让协程让出控制权，确保数据被发送
+                    await asyncio.sleep(0)
+                
+                print(f"Opus streaming completed: {chunk_count} chunks sent")
+                    
+            except HTTPException:
+                # 重新抛出 HTTP 异常
+                raise
+            except Exception as e:
+                print(f"❌ 流式 Opus 语音合成过程中发生错误: {e}")
+                import traceback
+                traceback.print_exc()
+                raise HTTPException(status_code=500, detail=f"流式 Opus 语音合成失败: {str(e)}")
+            finally:
+                # 清理处理状态
+                current_opus_request["is_processing"] = False
+                current_opus_request["start_time"] = None
+                current_opus_request["text_preview"] = None
+                current_opus_request["reference_audio_index"] = None
+                print("🔓 流式 Opus 语音合成完成，释放处理锁")
+        
+        # 返回流式 OGG 响应，添加实时传输头
+        return StreamingResponse(
+            generate_opus_stream(),
+            media_type="audio/ogg",  # 修改为正确的OGG MIME类型
+            headers={
+                "Content-Disposition": "attachment; filename=synthesized_audio.ogg",
+                "X-Opus-Sample-Rate": "48000",           # Opus 标准采样率
+                "X-Original-Sample-Rate": "24000",       # 原始采样率
+                "X-Opus-Bitrate": str(request.opus_bitrate),
+                "X-Opus-Complexity": str(request.opus_complexity),
+                "X-Channels": "1",                       # 单声道
+                "Transfer-Encoding": "chunked",          # 分块传输编码
+                "Cache-Control": "no-cache, no-store, must-revalidate",  # 禁用缓存
+                "Pragma": "no-cache",                   # HTTP/1.0缓存控制
+                "Expires": "0",                         # 立即过期
+                "Connection": "keep-alive",             # 保持连接
+                "X-Accel-Buffering": "no",             # 禁用nginx缓冲(如果有)
+                "X-Queue-Info": "sequential-processing", # 标识使用排队处理
+            }
+        )
+
+
 @app.get("/test")
 async def test_speech():
     """
@@ -437,17 +600,71 @@ async def get_model_info():
     }
 
 
+@app.get("/opus_queue_status")
+async def get_opus_queue_status():
+    """获取流式 Opus 合成的排队状态"""
+    status_info = {
+        "is_processing": current_opus_request["is_processing"],
+        "queue_available": not opus_synthesis_lock.locked(),
+        "timestamp": time.time()
+    }
+    
+    if current_opus_request["is_processing"]:
+        # 计算处理时长
+        processing_duration = time.time() - (current_opus_request["start_time"] or time.time())
+        status_info.update({
+            "current_request": {
+                "text_preview": current_opus_request["text_preview"],
+                "reference_audio_index": current_opus_request["reference_audio_index"],
+                "processing_duration_seconds": round(processing_duration, 2),
+                "start_time": current_opus_request["start_time"]
+            }
+        })
+    
+    return status_info
+
+
+@app.get("/test_stream")
+async def test_stream():
+    """测试流式传输的端点，每秒发送一个数据块"""
+    async def generate_test_stream():
+        for i in range(10):
+            test_data = f"数据块 {i+1}/10 - 时间戳: {time.time()}\n".encode()
+            print(f"📤 [TEST] 发送测试数据块 {i+1}: {len(test_data)} bytes")
+            yield test_data
+            await asyncio.sleep(1)  # 等待1秒
+        print("✅ [TEST] 测试流式传输完成")
+    
+    return StreamingResponse(
+        generate_test_stream(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
 if __name__ == "__main__":
     # 通过 start_api.sh 脚本启动，支持端口配置
     # 也可以直接运行: uvicorn api_server:app --host 0.0.0.0 --port 8000
     print("提示：建议使用 ./start_api.sh 启动服务，支持端口配置")
     print("或者直接使用: uvicorn api_server:app --host 0.0.0.0 --port 8000")
     
-    # 默认启动
+    # 默认启动，配置实时传输
     uvicorn.run(
         "api_server:app",
         host="0.0.0.0",
         port=8000,
         reload=False,  # 生产环境建议设为 False
-        workers=1      # TTS 模型通常不支持多进程，使用单个 worker
+        workers=1,     # TTS 模型通常不支持多进程，使用单个 worker
+        # 实时传输优化配置
+        http="httptools",           # 使用更快的HTTP解析器
+        loop="uvloop",             # 使用更快的事件循环(Linux)
+        timeout_keep_alive=65,     # 保持连接时间
+        limit_concurrency=10,      # 限制并发连接数
+        backlog=128               # 连接队列大小
     ) 

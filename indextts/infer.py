@@ -1,6 +1,8 @@
 import os
 import sys
 import time
+import io
+import subprocess
 from subprocess import CalledProcessError
 from typing import Dict, List, Tuple
 
@@ -242,15 +244,15 @@ class IndexTTS:
             return out_buckets
         return [outputs]
 
-    def pad_tokens_cat(self, tokens: List[torch.Tensor]) -> torch.Tensor:
+    def pad_tokens_cat(self, tokens_list: List[torch.Tensor]) -> torch.Tensor:
         if self.model_version and self.model_version >= 1.5:
             # 1.5版本以上，直接使用stop_text_token 右侧填充，填充到最大长度
             # [1, N] -> [N,]
-            tokens = [t.squeeze(0) for t in tokens]
-            return pad_sequence(tokens, batch_first=True, padding_value=self.cfg.gpt.stop_text_token, padding_side="right")
-        max_len = max(t.size(1) for t in tokens)
+            squeezed_tokens = [t.squeeze(0) for t in tokens_list]
+            return pad_sequence(squeezed_tokens, batch_first=True, padding_value=self.cfg.gpt.stop_text_token, padding_side="right")
+        max_len = max(t.size(1) for t in tokens_list)
         outputs = []
-        for tensor in tokens:
+        for tensor in tokens_list:
             pad_len = max_len - tensor.size(1)
             if pad_len > 0:
                 n = min(8, pad_len)
@@ -258,8 +260,8 @@ class IndexTTS:
                 tensor = torch.nn.functional.pad(tensor, (0, pad_len - n), value=self.cfg.gpt.start_text_token)
             tensor = tensor[:, :max_len]
             outputs.append(tensor)
-        tokens = torch.cat(outputs, dim=0)
-        return tokens
+        concatenated_tokens = torch.cat(outputs, dim=0)
+        return concatenated_tokens
 
     def torch_empty_cache(self):
         try:
@@ -381,7 +383,7 @@ class IndexTTS:
             self._set_gr_progress(0.2 + 0.3 * processed_num/all_batch_num, f"gpt inference speech... {processed_num}/{all_batch_num}")
             m_start_time = time.perf_counter()
             with torch.no_grad():
-                with torch.amp.autocast(batch_text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                with torch.autocast(batch_text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
                     temp_codes = self.gpt.inference_speech(auto_conditioning, batch_text_tokens,
                                         cond_mel_lengths=cond_mel_lengths,
                                         # text_lengths=text_len,
@@ -426,7 +428,7 @@ class IndexTTS:
                 all_idxs.append(batch_sentences[i]["idx"])
                 m_start_time = time.perf_counter()
                 with torch.no_grad():
-                    with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                    with torch.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
                         latent = \
                             self.gpt(auto_conditioning, text_tokens,
                                         torch.tensor([text_tokens.shape[-1]], device=text_tokens.device), codes,
@@ -453,7 +455,7 @@ class IndexTTS:
             tqdm_progress.update(len(items))
             latent = torch.cat(items, dim=1)
             with torch.no_grad():
-                with torch.amp.autocast(latent.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                with torch.autocast(latent.device.type, enabled=self.dtype is not None, dtype=self.dtype):
                     m_start_time = time.perf_counter()
                     wav, _ = self.bigvgan(latent, auto_conditioning.transpose(1, 2))
                     bigvgan_time += time.perf_counter() - m_start_time
@@ -626,7 +628,7 @@ class IndexTTS:
             print(f"🧠 [DEBUG] 开始GPT inference_speech...")
             gpt_gen_start = time.perf_counter()
             with torch.no_grad():
-                with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                with torch.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
                     codes = self.gpt.inference_speech(auto_conditioning, text_tokens,
                                                         cond_mel_lengths=torch.tensor([auto_conditioning.shape[-1]],
                                                                                       device=text_tokens.device),
@@ -703,7 +705,7 @@ class IndexTTS:
             print(f"🧠 [DEBUG] 开始GPT forward...")
             gpt_forward_start = time.perf_counter()
             with torch.no_grad():  # 确保没有梯度计算
-                with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                with torch.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
                     latent = self.gpt(auto_conditioning, text_tokens,
                                     torch.tensor([text_tokens.shape[-1]], device=text_tokens.device), codes,
                                     code_lens*self.gpt.mel_length_compression,
@@ -1065,12 +1067,248 @@ class IndexTTS:
                 wav_data = wav_data.T  # Gradio期望 (time, channels) 格式
             return (sampling_rate, wav_data)
 
+    def infer_opus(self, audio_prompt, text, verbose=False, max_text_tokens_per_sentence=120, 
+                   opus_bitrate=32000, opus_complexity=10, **generation_kwargs):
+        """
+        流式推理函数，逐句生成音频片段并返回 OGG 容器中的 Opus 编码音频数据流
+        
+        Args:
+            audio_prompt: 参考音频路径
+            text: 要合成的文本
+            verbose: 是否输出详细信息
+            max_text_tokens_per_sentence: 每句最大token数
+            opus_bitrate: Opus编码比特率 (默认32kbps，可选: 8000-512000)
+            opus_complexity: Opus编码复杂度 (0-10，越高质量越好但编码越慢)
+            **generation_kwargs: 生成参数
+            
+        Yields:
+            bytes: OGG容器格式的音频数据块 (内含Opus编码音频，ExoPlayer完美支持)
+        """
+        import threading
+        import queue
+        
+        print(">> Starting OGG (Opus) streaming inference...")
+        
+        # 检查 ffmpeg 是否可用
+        try:
+            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            raise RuntimeError("FFmpeg 未找到。请安装 FFmpeg 以支持 Opus 编码。")
+        
+        # 验证 Opus 参数
+        if not (8000 <= opus_bitrate <= 512000):
+            raise ValueError(f"Opus bitrate must be between 8000 and 512000, got {opus_bitrate}")
+        if not (0 <= opus_complexity <= 10):
+            raise ValueError(f"Opus complexity must be between 0 and 10, got {opus_complexity}")
+        
+        if verbose:
+            print(f"🎵 [DEBUG] Opus 配置: bitrate={opus_bitrate}bps, complexity={opus_complexity}")
+        
+        # 🎵 在循环外初始化 FFmpeg 进程
+        opus_sample_rate = 48000  # Opus 标准采样率
+        original_sample_rate = 24000  # TTS 输出采样率
+        
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-flags', 'low_delay',
+            '-f', 'f32le',  # 输入格式：32-bit float little-endian
+            '-ar', str(original_sample_rate),  # 输入采样率
+            '-ac', '1',  # 单声道
+            '-i', 'pipe:0',  # 从 stdin 读取
+            '-c:a', 'libopus',  # 使用 Opus 编码器
+            '-b:a', str(opus_bitrate),  # 设置比特率
+            '-compression_level', str(opus_complexity),  # 设置复杂度
+            '-frame_duration', '100',  # 100ms帧持续时间，适合实时传输
+            '-application', 'lowdelay',  # 优先保证音频质量和完整性
+            '-ar', str(opus_sample_rate),  # 输出采样率
+            '-f', 'ogg',  # 使用OGG容器
+            '-flush_packets', '1',  # 强制刷新包
+            '-y',  # 覆盖输出
+            'pipe:1'  # 输出到 stdout
+        ]
+        
+        print(f"🔧 [DEBUG] 启动 FFmpeg: {' '.join(ffmpeg_cmd)}")
+            
+        
+        # 启动 FFmpeg 进程
+        try:
+            ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0  # 无缓冲
+            )
+        except Exception as e:
+            print(f"Failed to start FFmpeg: {e}")
+            raise RuntimeError(f"Failed to start FFmpeg: {e}")
+        
+        # 检查进程是否立即退出
+        import time
+        time.sleep(0.1)
+        if ffmpeg_process.poll() is not None:
+            raise RuntimeError(f"FFmpeg process exited immediately with code: {ffmpeg_process.returncode}")
+        
+        # 创建输出队列用于异步读取
+        output_queue = queue.Queue()
+        error_queue = queue.Queue()
+        
+        def read_output():
+            """异步读取 FFmpeg 输出"""
+            try:
+                if ffmpeg_process.stdout is not None:
+                    while True:
+                        # 读取固定大小的数据块
+                        data = ffmpeg_process.stdout.read(4096)
+                        if not data:
+                            break
+                        output_queue.put(data)
+            except Exception as e:
+                error_queue.put(f"读取输出失败: {e}")
+            finally:
+                output_queue.put(None)  # 结束标记
+        
+        def read_error():
+            """异步读取 FFmpeg 错误输出"""
+            try:
+                if ffmpeg_process.stderr is not None:
+                    while True:
+                        error_line = ffmpeg_process.stderr.readline()
+                        if not error_line:
+                            break
+                        error_msg = error_line.decode('utf-8', errors='ignore').strip()
+                        if error_msg:
+                            print(f"🔴 [FFmpeg ERROR] {error_msg}")
+                            error_queue.put(error_msg)
+            except Exception as e:
+                error_msg = f"读取错误输出失败: {e}"
+                print(f"🔴 [ERROR] {error_msg}")
+                error_queue.put(error_msg)
+        
+        # 启动异步读取线程
+        output_thread = threading.Thread(target=read_output, daemon=True)
+        error_thread = threading.Thread(target=read_error, daemon=True)
+        output_thread.start()
+        error_thread.start()
+        
+        total_opus_size = 0
+        chunk_count = 0
+        
+        # FFmpeg will generate OGG header when it receives actual audio data
+        
+        try:
+            # 🎵 先发送一小段静音来"预热"FFmpeg，这依然是一个好习惯
+            try:
+                silence_duration_ms = 20
+                num_samples = int(original_sample_rate * silence_duration_ms / 1000)
+                silence = torch.zeros(num_samples, dtype=torch.float32)
+                if ffmpeg_process.stdin:
+                    ffmpeg_process.stdin.write(silence.numpy().tobytes())
+                    ffmpeg_process.stdin.flush()
+                if verbose:
+                    print(f"🎤 [DEBUG] Primed FFmpeg with {silence_duration_ms}ms of silence.")
+            except Exception as e:
+                print(f"⚠️ [WARNING] Failed to send priming silence to FFmpeg: {e}")
 
-if __name__ == "__main__":
-    prompt_wav="test_data/input.wav"
-    #text="晕 XUAN4 是 一 种 GAN3 觉"
-    #text='大家好，我现在正在bilibili 体验 ai 科技，说实话，来之前我绝对想不到！AI技术已经发展到这样匪夷所思的地步了！'
-    text="There is a vehicle arriving in dock number 7?"
+            # 🔄 使用流式推理获取音频片段并发送给 FFmpeg
+            for chunk_info in self.infer_stream(audio_prompt, text, verbose, max_text_tokens_per_sentence, **generation_kwargs):
+                chunk_start_time = time.perf_counter()
+                
+                # 获取音频数据 (torch.Tensor, float32, 单声道)
+                audio_chunk = chunk_info['audio_chunk']
+                
+                # 🎯 音频预处理
+                if audio_chunk.dim() != 1:
+                    audio_chunk = audio_chunk.flatten()
+                
+                # 检查音频长度，避免发送空音频
+                if audio_chunk.numel() == 0:
+                    if verbose:
+                        print(f"⚠️ [DEBUG] 跳过空音频片段 (句子 {chunk_info['sentence_index'] + 1})")
+                    continue
+                
+                # 转换为 numpy 数组并归一化
+                audio_np = audio_chunk.clamp(-1.0, 1.0).numpy()
+                
+                try:
+                    # 发送音频数据到 FFmpeg
+                    if ffmpeg_process.stdin is not None:
+                        ffmpeg_process.stdin.write(audio_np.tobytes())
+                        ffmpeg_process.stdin.flush()
+                    
+                    chunk_count += 1
+                    
+                    # 🎵 读取所有已经可用的Opus输出数据
+                    # 在非低延迟模式下，FFmpeg会缓冲数据，所以我们在这里非阻塞地拉取
+                    while True:
+                        try:
+                            opus_data = output_queue.get_nowait()
+                            if opus_data: # is not None
+                                total_opus_size += len(opus_data)
+                                yield opus_data
+                            else: # is None, stream ended prematurely
+                                break
+                        except queue.Empty:
+                            # 队列为空，表示当前没有可用的输出，继续处理下一个音频块
+                            break
+                    
+                    # 检查FFmpeg进程状态
+                    if ffmpeg_process.poll() is not None:
+                        print(f"FFmpeg process exited with code: {ffmpeg_process.returncode}")
+                        break
+                        
+                except BrokenPipeError:
+                    print("❌ [ERROR] FFmpeg 进程意外终止")
+                    break
+                except Exception as e:
+                    print(f"❌ [ERROR] 发送数据到 FFmpeg 失败: {e}")
+                    if verbose:
+                        import traceback
+                        traceback.print_exc()
+                    break
+            
+            # 🔚 完成所有音频后，关闭 stdin 并读取剩余输出
+            if verbose:
+                print("🔚 [DEBUG] 关闭 FFmpeg 输入流...")
+                
+            if ffmpeg_process.stdin is not None:
+                ffmpeg_process.stdin.close()
+            
+            # 读取剩余的输出数据
+            final_start = time.perf_counter()
+            while True:
+                try:
+                    opus_data = output_queue.get(timeout=5.0)  # 5秒超时
+                    if opus_data is None:
+                        break
+                    elif isinstance(opus_data, bytes) and len(opus_data) > 0:
+                        total_opus_size += len(opus_data)
+                        if verbose:
+                            print(f"📦 [DEBUG] 收到最终 Opus 数据: {len(opus_data):,} bytes")
+                        yield opus_data
+                except queue.Empty:
+                    # 超时，可能没有更多数据
+                    if verbose:
+                        print("⏰ [DEBUG] 等待最终输出超时")
+                    break
+            
+            if verbose:
+                final_time = time.perf_counter() - final_start
+                print(f"🔚 [DEBUG] 最终数据读取耗时: {final_time:.3f}s")
+        
+        finally:
+            # 清理资源
+            try:
+                if ffmpeg_process.poll() is None:
+                    ffmpeg_process.terminate()
+                    ffmpeg_process.wait(timeout=5.0)
+            except Exception as e:
+                try:
+                    ffmpeg_process.kill()
+                except:
+                    pass
+        
+        print(f">> OGG (Opus) streaming completed: {chunk_count} chunks, {total_opus_size:,} bytes")
 
-    tts = IndexTTS(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", is_fp16=True, use_cuda_kernel=False)
-    tts.infer(audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=True)
+
+
