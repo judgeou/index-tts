@@ -5,6 +5,8 @@ import io
 import subprocess
 from subprocess import CalledProcessError
 from typing import Dict, List, Tuple
+import threading
+from typing import Optional
 
 import torch
 import torchaudio
@@ -23,6 +25,11 @@ from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.feature_extractors import MelSpectrogramFeatures
 
 from indextts.utils.front import TextNormalizer, TextTokenizer
+
+
+class InferenceCancelledError(Exception):
+    """自定义异常，用于表示推理被用户取消"""
+    pass
 
 
 class IndexTTS:
@@ -499,7 +506,7 @@ class IndexTTS:
             return (sampling_rate, wav_data)
 
     # 流式推理模式 - 逐句生成音频片段
-    def infer_stream(self, audio_prompt, text, verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
+    def infer_stream(self, audio_prompt, text, verbose=False, max_text_tokens_per_sentence=120, cancellation_event: Optional[threading.Event] = None, **generation_kwargs):
         """
         流式推理函数，逐句生成音频片段
         
@@ -508,6 +515,7 @@ class IndexTTS:
             text: 要合成的文本
             verbose: 是否输出详细信息
             max_text_tokens_per_sentence: 每句最大token数
+            cancellation_event: 用于中途中断的线程事件
             **generation_kwargs: 生成参数
             
         Yields:
@@ -596,6 +604,11 @@ class IndexTTS:
         print(f"🔄 [DEBUG] 开始逐句处理 {total_sentences} 个句子")
         
         for sentence_idx, sent in enumerate(sentences):
+            # 检查是否有取消请求
+            if cancellation_event and cancellation_event.is_set():
+                print("🛑 [DEBUG] 检测到取消信号，正在中止流式推理...")
+                raise InferenceCancelledError("推理被取消")
+
             sentence_start_time = time.perf_counter()
             print(f"\n🔄 [DEBUG] === 处理第 {sentence_idx + 1}/{total_sentences} 句 ===")
             
@@ -1068,7 +1081,7 @@ class IndexTTS:
             return (sampling_rate, wav_data)
 
     def infer_opus(self, audio_prompt, text, verbose=False, max_text_tokens_per_sentence=120, 
-                   opus_bitrate=32000, opus_complexity=10, **generation_kwargs):
+                   opus_bitrate=32000, opus_complexity=10, cancellation_event: Optional[threading.Event] = None, **generation_kwargs):
         """
         流式推理函数，逐句生成音频片段并返回 OGG 容器中的 Opus 编码音频数据流
         
@@ -1079,6 +1092,7 @@ class IndexTTS:
             max_text_tokens_per_sentence: 每句最大token数
             opus_bitrate: Opus编码比特率 (默认32kbps，可选: 8000-512000)
             opus_complexity: Opus编码复杂度 (0-10，越高质量越好但编码越慢)
+            cancellation_event: 用于中途中断的线程事件
             **generation_kwargs: 生成参数
             
         Yields:
@@ -1211,7 +1225,7 @@ class IndexTTS:
                 print(f"⚠️ [WARNING] Failed to send priming silence to FFmpeg: {e}")
 
             # 🔄 使用流式推理获取音频片段并发送给 FFmpeg
-            for chunk_info in self.infer_stream(audio_prompt, text, verbose, max_text_tokens_per_sentence, **generation_kwargs):
+            for chunk_info in self.infer_stream(audio_prompt, text, verbose, max_text_tokens_per_sentence, cancellation_event=cancellation_event, **generation_kwargs):
                 chunk_start_time = time.perf_counter()
                 
                 # 获取音频数据 (torch.Tensor, float32, 单声道)
