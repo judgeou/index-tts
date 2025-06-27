@@ -637,6 +637,10 @@ class IndexTTS:
                 print(f"\n--- Processing sentence {sentence_idx + 1}/{total_sentences} ---")
                 print(f"text_tokens shape: {text_tokens.shape}, text_tokens type: {text_tokens.dtype}")
 
+            if cancellation_event and cancellation_event.is_set():
+                print("🛑 [DEBUG] 检测到取消信号，正在中止流式推理...")
+                raise InferenceCancelledError("推理被取消")
+            
             # GPT inference_speech 生成codes
             print(f"🧠 [DEBUG] 开始GPT inference_speech...")
             gpt_gen_start = time.perf_counter()
@@ -713,6 +717,10 @@ class IndexTTS:
             if verbose:
                 print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
                 print(f"code len: {code_lens}")
+
+            if cancellation_event and cancellation_event.is_set():
+                print("🛑 [DEBUG] 检测到取消信号，正在中止流式推理...")
+                raise InferenceCancelledError("推理被取消")
                 
             # GPT forward 生成latent
             print(f"🧠 [DEBUG] 开始GPT forward...")
@@ -735,6 +743,10 @@ class IndexTTS:
                     print(f"🔍 [DEBUG] GPT forward后GPU内存: {gpu_memory_after_gpt_forward:.2f} GB")
                 except:
                     pass
+
+            if cancellation_event and cancellation_event.is_set():
+                print("🛑 [DEBUG] 检测到取消信号，正在中止流式推理...")
+                raise InferenceCancelledError("推理被取消")
 
             # BigVGAN 生成wav
             print(f"🎵 [DEBUG] 开始BigVGAN生成...")
@@ -1211,18 +1223,6 @@ class IndexTTS:
         # FFmpeg will generate OGG header when it receives actual audio data
         
         try:
-            # 🎵 先发送一小段静音来"预热"FFmpeg，这依然是一个好习惯
-            try:
-                silence_duration_ms = 20
-                num_samples = int(original_sample_rate * silence_duration_ms / 1000)
-                silence = torch.zeros(num_samples, dtype=torch.float32)
-                if ffmpeg_process.stdin:
-                    ffmpeg_process.stdin.write(silence.numpy().tobytes())
-                    ffmpeg_process.stdin.flush()
-                if verbose:
-                    print(f"🎤 [DEBUG] Primed FFmpeg with {silence_duration_ms}ms of silence.")
-            except Exception as e:
-                print(f"⚠️ [WARNING] Failed to send priming silence to FFmpeg: {e}")
 
             # 🔄 使用流式推理获取音频片段并发送给 FFmpeg
             for chunk_info in self.infer_stream(audio_prompt, text, verbose, max_text_tokens_per_sentence, cancellation_event=cancellation_event, **generation_kwargs):
