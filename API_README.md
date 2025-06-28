@@ -1,425 +1,231 @@
-# IndexTTS HTTP API 使用说明
+# IndexTTS API 文档
 
-这是 IndexTTS 的 HTTP API 接口，为 Android TextToSpeechService 等应用提供语音合成服务。
+本文档详细介绍了 IndexTTS API 服务器 (`api_server.py`) 提供的所有接口。
 
-## 🚀 快速开始
+## 启动服务
 
-### 1. 安装依赖
+通过项目根目录下的 `start_api.sh` 脚本启动 API 服务。您可以修改该脚本来指定端口号。
 
 ```bash
-# 安装 FastAPI 和 uvicorn
-pip install fastapi uvicorn
-
-# 或者如果已有 requirements.txt，直接安装
-pip install -r requirements.txt
-```
-
-### 2. 启动服务
-
-#### 方法一：使用启动脚本（推荐）
-```bash
-# 默认端口 8000
+# 启动 API 服务 (默认端口 8000)
 ./start_api.sh
 
-# 指定端口
-./start_api.sh 8080
-
-# 使用环境变量
-API_PORT=9000 ./start_api.sh
-
-# 查看帮助
-./start_api.sh --help
+# 或者指定端口
+PORT=8888 ./start_api.sh
 ```
 
-#### 方法二：直接运行
-```bash
-python api_server.py
-```
+服务启动后，您可以通过 `http://<服务器IP>:<端口号>` 访问 API。
 
-#### 方法三：使用 uvicorn 命令
-```bash
-uvicorn api_server:app --host 0.0.0.0 --port 8000 --workers 1
-```
+## API 接口详解
 
-### 3. 访问 API
+---
 
-- **服务地址**: http://localhost:8000
-- **API 文档**: http://localhost:8000/docs (Swagger UI)
-- **交互式文档**: http://localhost:8000/redoc
+### 1. 通用和状态接口
 
-## 📚 API 接口说明
+#### `GET /`
 
-### 1. 健康检查
-```http
-GET /health
-```
+- **功能**: API 根路径，返回服务的基本信息。
+- **请求**: `GET http://127.0.0.1:8000/`
+- **响应**:
+  ```json
+  {
+    "message": "IndexTTS API 服务运行中",
+    "version": "1.0.0",
+    "status": "running",
+    "model_loaded": true
+  }
+  ```
 
-返回服务状态和模型加载情况。
+#### `GET /health`
 
-### 2. 模型信息
-```http
-GET /model_info
-```
+- **功能**: 健康检查接口，用于监控服务状态。
+- **请求**: `GET http://127.0.0.1:8000/health`
+- **响应**:
+  ```json
+  {
+    "status": "healthy",
+    "model_loaded": true,
+    "timestamp": 1678886400.0
+  }
+  ```
 
-获取当前加载的模型详细信息。
+---
 
-### 3. 测试语音合成
-```http
-GET /test
-```
+### 2. 核心语音合成接口
 
-快速测试语音合成服务，使用固定文本"欢迎使用TTS服务"进行测试。不需要任何参数，返回合成的音频文件。
+#### `POST /synthesize`
 
-### 4. 参考音频列表
-```http
-GET /reference_audios
-```
+- **功能**: 全功能语音合成接口，一次性返回完整的 WAV 音频文件。支持所有推理参数。
+- **请求**: `POST http://127.0.0.1:8000/synthesize`
+- **请求体 (Body)**: `application/json`
+  ```json
+  {
+    "text": "你好，欢迎使用 IndexTTS。",
+    "reference_audio_index": 0,
+    "use_fast_inference": false,
+    "verbose": false,
+    "max_text_tokens_per_sentence": 120,
+    "do_sample": true,
+    "top_p": 0.95,
+    "top_k": 30,
+    "temperature": 1.2,
+    "length_penalty": 0.0,
+    "num_beams": 3,
+    "repetition_penalty": 10.0,
+    "max_mel_tokens": 600,
+    "sentences_bucket_max_size": 2
+  }
+  ```
+- **参数说明**:
+    - `text` (str, 必填): 要合成的文本。
+    - `reference_audio_index` (int, 默认 0): 参考音频的序号。
+    - `use_fast_inference` (bool, 默认 `false`): 是否使用快速推理模式。
+    - `verbose` (bool, 默认 `false`): 是否在服务端打印详细日志。
+    - `max_text_tokens_per_sentence` (int, 默认 120): 分句时每句话的最大 token 数量。
+    - **生成参数**: `do_sample`, `top_p`, `top_k`, `temperature`, `length_penalty`, `num_beams`, `repetition_penalty`, `max_mel_tokens` 控制生成效果。
+    - `sentences_bucket_max_size` (int, 默认 2): (仅快速推理) 分句分桶的最大容量。
+- **响应**: `audio/wav` 格式的音频文件。
 
-获取可用的参考音频列表，包含序号、文件路径和是否存在等信息。
+#### `POST /synthesize_simple`
 
-### 5. 语音合成（完整接口）
-```http
-POST /synthesize
-```
+- **功能**: 简化的语音合成接口，使用默认参数，方便快速调用。
+- **请求**: `POST http://127.0.0.1:8000/synthesize_simple`
+- **请求体 (Body)**: `application/json`
+  ```json
+  {
+    "text": "这是一个简单的测试。",
+    "reference_audio_index": 0
+  }
+  ```
+- **响应**: `audio/wav` 格式的音频文件。
 
-**参数说明**:
-- `text` (必需): 要合成的文本
-- `reference_audio_index` (可选): 参考音频序号，默认 `0`
-- `use_fast_inference` (可选): 是否使用快速推理，默认 `true`
-- `verbose` (可选): 是否输出详细日志，默认 `false`
-- `max_text_tokens_per_sentence` (可选): 每句话的最大token数，默认 `120`
+---
 
-**生成参数**:
-- `do_sample`: 是否使用采样，默认 `true`
-- `top_p`: top_p 采样参数，默认 `0.8`
-- `top_k`: top_k 采样参数，默认 `30`
-- `temperature`: 温度参数，默认 `1.0`
-- `length_penalty`: 长度惩罚，默认 `0.0`
-- `num_beams`: 束搜索数量，默认 `3`
-- `repetition_penalty`: 重复惩罚，默认 `10.0`
-- `max_mel_tokens`: 最大mel token数量，默认 `600`
+### 3. 流式语音合成接口
 
-**快速推理专用参数**:
-- `sentences_bucket_max_size`: 分句分桶的最大容量，默认 `4`
+流式接口适合需要低延迟、实时返回音频流的场景。
 
-### 6. 语音合成（简化接口）
-```http
-POST /synthesize_simple
-```
+#### `POST /synthesize_stream`
 
-**参数说明**:
-- `text` (必需): 要合成的文本
-- `reference_audio_index` (可选): 参考音频序号，默认 `0`
+- **功能**: 流式语音合成，返回原始的 16-bit PCM 音频数据流。
+- **请求**: `POST http://127.0.0.1:8000/synthesize_stream`
+- **请求体 (Body)**: 与 `/synthesize` 类似，但不包含 `use_fast_inference` 和 `sentences_bucket_max_size`。
+- **响应**: `application/octet-stream` 格式的原始 PCM 数据流。响应头中包含采样率等信息 (`X-Sample-Rate`, `X-Bit-Depth`, `X-Channels`)。
 
-使用默认参数进行语音合成，适合简单的 TTS 调用。
+#### `POST /synthesize_stream_opus`
 
-## 🔧 客户端使用示例
+- **功能**: **(推荐)** 流式语音合成，返回 OGG 容器承载的 Opus 编码音频流。相比 PCM，流量消耗极小，非常适合网络传输。
+- **注意**: 此接口内部有排队机制，服务器一次只处理一个请求，后续请求会排队等待。
+- **请求**: `POST http://127.0.0.1:8000/synthesize_stream_opus`
+- **请求体 (Body)**: 在 `/synthesize_stream` 的基础上增加了 Opus 编码参数。
+  ```json
+  {
+    "text": "这是一个流式 Opus 合成测试。",
+    "reference_audio_index": 0,
+    "opus_bitrate": 32000,
+    "opus_complexity": 10
+    // ... 其他生成参数
+  }
+  ```
+- **Opus 参数**:
+    - `opus_bitrate` (int, 默认 32000): Opus 编码比特率 (范围: 8000-512000)。
+    - `opus_complexity` (int, 默认 10): Opus 编码复杂度 (范围: 0-10)，越高计算量越大，质量越好。
+- **响应**: `audio/ogg` 格式的 Opus 音频流。
 
-### Python 客户端
+#### `GET /opus_queue_status`
 
-我们提供了完整的 Python 客户端示例 `client_example.py`：
-
-```bash
-# 快速测试服务
-python client_example.py --test
-
-# 查看可用的参考音频
-python client_example.py --list-audio
-
-# 基本使用（使用默认参考音频序号0）
-python client_example.py -t "你好，这是一个测试"
-
-# 指定参考音频序号
-python client_example.py -t "你好，这是一个测试" -r 0
-
-# 使用简化接口
-python client_example.py -t "你好，这是一个测试" --simple
-
-# 详细输出
-python client_example.py -t "你好，这是一个测试" -v
-
-# 指定输出文件
-python client_example.py -t "你好，这是一个测试" -o my_output.wav
-
-# 连接到远程服务器
-python client_example.py -t "你好，这是一个测试" --url http://192.168.1.100:8000
-```
-
-### cURL 示例
-
-```bash
-# 健康检查
-curl -X GET "http://localhost:8000/health"
-
-# 快速测试语音合成
-curl -X GET "http://localhost:8000/test" --output test_output.wav
-
-# 获取参考音频列表
-curl -X GET "http://localhost:8000/reference_audios"
-
-# 语音合成（简化接口）
-curl -X POST "http://localhost:8000/synthesize_simple" \
-     -F "text=你好，这是一个测试" \
-     -F "reference_audio_index=0" \
-     --output output.wav
-
-# 语音合成（完整接口）
-curl -X POST "http://localhost:8000/synthesize" \
-     -F "text=你好，这是一个测试" \
-     -F "reference_audio_index=0" \
-     -F "use_fast_inference=true" \
-     -F "temperature=1.0" \
-     -F "top_p=0.8" \
-     --output output.wav
-```
-
-### JavaScript/TypeScript 示例
-
-```javascript
-// 测试语音合成服务
-async function testSpeech() {
-    try {
-        const response = await fetch('http://localhost:8000/test');
-        if (response.ok) {
-            const audioBlob = await response.blob();
-            // 处理音频 blob
-            return audioBlob;
-        } else {
-            console.error('测试失败:', response.statusText);
-        }
-    } catch (error) {
-        console.error('测试请求失败:', error);
+- **功能**: 获取 `/synthesize_stream_opus` 接口的排队状态。
+- **请求**: `GET http://127.0.0.1:8000/opus_queue_status`
+- **响应**:
+  - 如果当前无任务:
+    ```json
+    {
+      "is_processing": false,
+      "queue_available": true,
+      "timestamp": 1678886400.0
     }
-}
-
-async function synthesizeSpeech(text, referenceAudioIndex = 0) {
-    const formData = new FormData();
-    formData.append('text', text);
-    formData.append('reference_audio_index', referenceAudioIndex);
-    formData.append('use_fast_inference', 'true');
-    
-    try {
-        const response = await fetch('http://localhost:8000/synthesize_simple', {
-            method: 'POST',
-            body: formData
-        });
-        
-        if (response.ok) {
-            const audioBlob = await response.blob();
-            // 处理音频 blob
-            return audioBlob;
-        } else {
-            console.error('语音合成失败:', response.statusText);
-        }
-    } catch (error) {
-        console.error('请求失败:', error);
+    ```
+  - 如果当前有任务在处理:
+    ```json
+    {
+      "is_processing": true,
+      "queue_available": false,
+      "timestamp": 1678886400.0,
+      "current_request": {
+        "text_preview": "这是一个流式 Opus 合成测试...",
+        "reference_audio_index": 0,
+        "processing_duration_seconds": 5.23,
+        "start_time": 1678886394.77
+      }
     }
-}
+    ```
 
-// 获取参考音频列表
-async function getReferenceAudios() {
-    try {
-        const response = await fetch('http://localhost:8000/reference_audios');
-        if (response.ok) {
-            const data = await response.json();
-            return data.reference_audios;
-        }
-    } catch (error) {
-        console.error('获取参考音频列表失败:', error);
-    }
-    return [];
-}
-```
+---
 
-## 🤖 Android 集成示例
+### 4. 参考音频管理
 
-对于 Android TextToSpeechService，可以参考以下集成方式：
+#### `GET /reference_audios`
 
-```java
-// 使用 OkHttp 进行网络请求
-public class IndexTTSService extends TextToSpeechService {
-    private static final String API_URL = "http://your-server:8000/synthesize_simple";
-    private static final String TEST_URL = "http://your-server:8000/test";
-    
-    // 测试语音合成服务
-    private void testSpeech(Callback callback) {
-        OkHttpClient client = new OkHttpClient();
-        
-        Request request = new Request.Builder()
-            .url(TEST_URL)
-            .get()
-            .build();
-            
-        client.newCall(request).enqueue(callback);
-    }
-    
-    private void synthesizeText(String text, int referenceAudioIndex, Callback callback) {
-        OkHttpClient client = new OkHttpClient();
-        
-        RequestBody requestBody = new MultipartBody.Builder()
-            .setType(MultipartBody.FORM)
-            .addFormDataPart("text", text)
-            .addFormDataPart("reference_audio_index", String.valueOf(referenceAudioIndex))
-            .build();
-            
-        Request request = new Request.Builder()
-            .url(API_URL)
-            .post(requestBody)
-            .build();
-            
-        client.newCall(request).enqueue(callback);
-    }
-    
-    // 获取参考音频列表
-    private void getReferenceAudios(Callback callback) {
-        OkHttpClient client = new OkHttpClient();
-        
-        Request request = new Request.Builder()
-            .url("http://your-server:8000/reference_audios")
-            .get()
-            .build();
-            
-        client.newCall(request).enqueue(callback);
-    }
-}
-```
+- **功能**: 获取当前所有可用的参考音频列表。
+- **请求**: `GET http://127.0.0.1:8000/reference_audios`
+- **响应**:
+  ```json
+  {
+    "reference_audios": [
+      {
+        "index": 0,
+        "path": "/path/to/your/audios/sample1.wav",
+        "exists": true,
+        "filename": "sample1.wav"
+      },
+      {
+        "index": 1,
+        "path": "/path/to/your/audios/sample2.mp3",
+        "exists": true,
+        "filename": "sample2.mp3"
+      }
+    ],
+    "total_count": 2
+  }
+  ```
 
-## ⚙️ 配置选项
+#### `GET /download_reference_audio/{audio_index}`
 
-### 参考音频配置
+- **功能**: 下载指定的参考音频文件。
+- **请求**: `GET http://127.0.0.1:8000/download_reference_audio/0`
+- **参数**:
+    - `audio_index` (int, 路径参数): 要下载的音频序号。
+- **响应**: 对应的音频文件。
 
-参考音频文件通过 `api_server.py` 中的 `REFERENCE_AUDIO_FILES` 数组配置：
+---
 
-```python
-# 预设的参考音频文件列表
-REFERENCE_AUDIO_FILES = [
-    "/mnt/f/project/fish-speech/source/boke-male.mp3",
-    # 可以在这里添加更多参考音频文件
-    # "/path/to/your/audio1.wav",
-    # "/path/to/your/audio2.mp3",
-]
-```
+### 5. 模型和测试接口
 
-**添加新的参考音频**：
-1. 将音频文件放置到服务器可访问的路径
-2. 在 `REFERENCE_AUDIO_FILES` 数组中添加文件路径
-3. 重启 API 服务
-4. 使用 `GET /reference_audios` 确认新音频已添加
+#### `GET /model_info`
 
-**音频格式要求**：
-- 支持常见音频格式：wav, mp3, flac, m4a, ogg
-- 建议使用清晰、无噪音的语音样本
-- 推荐时长：3-10秒
+- **功能**: 获取当前加载的 IndexTTS 模型信息。
+- **请求**: `GET http://127.0.0.1:8000/model_info`
+- **响应**:
+  ```json
+  {
+    "model_loaded": true,
+    "device": "cuda:0",
+    "is_fp16": true,
+    "use_cuda_kernel": false,
+    "model_version": "1.5.0",
+    "config_path": "checkpoints/config.yaml",
+    "model_dir": "checkpoints"
+  }
+  ```
 
-### 服务器配置
+#### `GET /test`
 
-可以通过修改 `api_server.py` 中的参数来调整服务器配置：
+- **功能**: 一个简单的测试接口，使用固定的文本 "欢迎使用TTS服务" 和默认参数进行快速推理，用于验证服务是否正常工作。
+- **请求**: `GET http://127.0.0.1:8000/test`
+- **响应**: `audio/wav` 格式的音频文件。
 
-```python
-# 修改监听地址和端口
-uvicorn.run(
-    "api_server:app",
-    host="0.0.0.0",      # 监听所有接口
-    port=8000,           # 端口号
-    reload=False,        # 生产环境建议关闭
-    workers=1            # worker 数量（TTS 模型建议为 1）
-)
-```
+#### `GET /test_stream`
 
-### 模型配置
-
-可以通过修改模型初始化参数来调整性能：
-
-```python
-tts_model = IndexTTS(
-    cfg_path="checkpoints/config.yaml",
-    model_dir="checkpoints",
-    is_fp16=True,        # 是否使用半精度，可提升速度
-    device="cuda:0",     # 指定设备
-    use_cuda_kernel=True # 是否使用 CUDA 内核加速
-)
-```
-
-## 🧪 快速测试
-
-### 服务测试
-
-使用内置的测试接口可以快速验证服务是否正常工作：
-
-**API 调用**：
-```bash
-curl -X GET "http://localhost:8000/test" --output test.wav
-```
-
-**Python 客户端**：
-```bash
-python client_example.py --test
-```
-
-**JavaScript**：
-```javascript
-const audioBlob = await testSpeech();
-```
-
-**测试特点**：
-- ✅ 使用固定文本："欢迎使用TTS服务"
-- ✅ 使用默认参考音频（序号0）
-- ✅ 使用快速推理模式
-- ✅ 无需额外参数
-- ✅ 直接返回音频文件
-
-**测试用途**：
-- 🔍 验证服务状态
-- 🎯 检查音频质量
-- ⚡ 测试推理速度
-- 📱 Android 开发调试
-- 🚀 部署后验证
-
-## 🔍 故障排除
-
-### 常见问题
-
-1. **模型加载失败**
-   - 检查 `checkpoints/config.yaml` 是否存在
-   - 确保模型文件完整下载
-   - 查看详细错误信息
-
-2. **CUDA 相关错误**
-   - 设置 `use_cuda_kernel=False`
-   - 检查 CUDA 环境是否正确安装
-
-3. **内存不足**
-   - 减少 `sentences_bucket_max_size`
-   - 减少 `max_text_tokens_per_sentence`
-   - 使用 CPU 推理：`device="cpu"`
-
-4. **推理速度慢**
-   - 使用 `use_fast_inference=True`
-   - 启用 FP16：`is_fp16=True`
-   - 使用 GPU 加速
-
-5. **测试接口失败**
-   - 首先运行 `GET /health` 检查服务状态
-   - 检查参考音频文件是否存在
-   - 查看服务器日志获取详细错误信息
-
-### 性能优化
-
-1. **快速推理模式**：`use_fast_inference=True`
-2. **调整分句参数**：减少 `max_text_tokens_per_sentence`
-3. **增加批处理大小**：增加 `sentences_bucket_max_size`
-4. **使用 GPU**：确保 CUDA 环境正确
-5. **启用 FP16**：在支持的硬件上使用半精度
-
-## 📝 注意事项
-
-1. **线程安全**：当前实现使用单个模型实例，建议使用单个 worker
-2. **内存管理**：模型会自动清理 GPU 缓存，但长时间运行建议定期重启
-3. **文件清理**：临时文件会自动清理，无需手动处理
-4. **并发限制**：由于模型特性，建议限制并发请求数量
-
-## 🔗 相关链接
-
-- [IndexTTS 项目主页](https://github.com/index-tts/index-tts)
-- [FastAPI 官方文档](https://fastapi.tiangolo.com/)
-- [Android TextToSpeechService 文档](https://developer.android.com/reference/android/speech/tts/TextToSpeechService) 
+- **功能**: 一个用于测试服务器流式传输能力的接口。它会每秒发送一个数据块，持续10秒。
+- **请求**: `GET http://127.0.0.1:8000/test_stream`
+- **响应**: `text/plain` 格式的文本流。 

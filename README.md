@@ -217,6 +217,15 @@ python webui.py --model_dir IndexTTS-1.5
 Open your browser and visit `http://127.0.0.1:7860` to see the demo.
 
 
+#### API Server
+This project includes a FastAPI-based API server for providing TTS services over HTTP. For detailed usage and endpoint documentation, please see [API_README.md](./API_README.md).
+
+To start the server:
+```bash
+./start_api.sh
+```
+
+
 #### Sample Code
 ```python
 from indextts.infer import IndexTTS
