@@ -45,11 +45,34 @@ current_opus_request = {
     "reference_audio_index": None
 }
 
-# 预设的参考音频文件列表
-REFERENCE_AUDIO_FILES = [
-    "/mnt/f/project/fish-speech/source/boke-male.mp3",
-    # 可以在这里添加更多参考音频文件
-]
+# 参考音频配置
+REFERENCE_AUDIO_DIRECTORY = Path("/mnt/f/project/fish-speech/source")
+REFERENCE_AUDIO_FILES: list[str] = [] # 启动时从 REFERENCE_AUDIO_DIRECTORY 加载
+
+
+def load_reference_audios():
+    """从指定目录加载参考音频文件"""
+    global REFERENCE_AUDIO_FILES
+    if not REFERENCE_AUDIO_DIRECTORY.is_dir():
+        print(f"⚠️ 参考音频目录不存在或不是一个目录: {REFERENCE_AUDIO_DIRECTORY}")
+        REFERENCE_AUDIO_FILES = []
+        return
+
+    print(f"🎵 正在从 {REFERENCE_AUDIO_DIRECTORY} 加载参考音频...")
+    allowed_extensions = ['.wav', '.mp3', '.opus']
+    audio_files = []
+    # 使用 sorted 确保文件顺序一致
+    for p in sorted(REFERENCE_AUDIO_DIRECTORY.glob('*')):
+        if p.is_file() and p.suffix.lower() in allowed_extensions:
+            audio_files.append(str(p))
+    
+    REFERENCE_AUDIO_FILES = audio_files
+    if REFERENCE_AUDIO_FILES:
+        print(f"✅ 成功加载 {len(REFERENCE_AUDIO_FILES)} 个参考音频:")
+        for i, f in enumerate(REFERENCE_AUDIO_FILES):
+            print(f"  [{i}] {Path(f).name}")
+    else:
+        print("🟡 未找到任何参考音频文件。")
 
 
 # Pydantic 模型定义
@@ -265,8 +288,9 @@ async def _synthesize_speech_core(request: SynthesizeRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    """应用启动时初始化模型"""
+    """应用启动时初始化模型并加载参考音频"""
     initialize_model()
+    load_reference_audios()
 
 
 @app.get("/")
@@ -620,6 +644,40 @@ async def get_reference_audios():
         "reference_audios": audio_list,
         "total_count": len(REFERENCE_AUDIO_FILES)
     }
+
+
+@app.get("/download_reference_audio/{audio_index}")
+async def download_reference_audio(audio_index: int):
+    """
+    下载指定的参考音频文件。
+
+    Args:
+        audio_index: 参考音频的序号 (从 /reference_audios 接口获取)。
+
+    Returns:
+        对应的参考音频文件。
+    """
+    if not (0 <= audio_index < len(REFERENCE_AUDIO_FILES)):
+        raise HTTPException(
+            status_code=404,
+            detail=f"参考音频序号无效: {audio_index}。有效范围: 0-{len(REFERENCE_AUDIO_FILES) - 1}"
+        )
+
+    audio_path = REFERENCE_AUDIO_FILES[audio_index]
+
+    if not os.path.exists(audio_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"参考音频文件不存在或已被删除: {audio_path}"
+        )
+    
+    filename = os.path.basename(audio_path)
+
+    return FileResponse(
+        path=audio_path,
+        filename=filename,
+        media_type='application/octet-stream'
+    )
 
 
 @app.get("/model_info")
